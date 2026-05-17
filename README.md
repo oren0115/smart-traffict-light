@@ -11,6 +11,7 @@ Sistem lampu lalu lintas pintar berbasis **ESP32** dengan arsitektur **modular d
 - **Sensor HC-SR04** per persimpangan — deteksi kendaraan di jalur hijau
 - **Hijau adaptif** — maksimal 60 detik; jika jalur kosong, langsung pindah ke persimpangan berikutnya
 - **Transisi aman** — kuning 3 detik sebelum merah dan pergantian hijau
+- **Mode idle** — jika **semua** jalur kosong (tidak ada kendaraan di sensor manapun), **semua lampu kuning** menyala; operasi hijau/merah berhenti sampai ada kendaraan
 
 ## Perangkat
 
@@ -61,6 +62,15 @@ stateDiagram-v2
 4. Jika masih ada kendaraan (&lt; 15 cm) → hijau tetap hingga **60 detik**, lalu pindah seperti di atas.
 5. Rotasi: `0 → 1 → … → N-1 → 0`.
 
+### Mode traffic kosong (idle)
+
+| Kondisi | Lampu |
+|---------|--------|
+| **Semua** sensor tidak mendeteksi kendaraan | **Semua persimpangan kuning kedip** (500 ms on/off, merah & hijau mati) |
+| Ada kendaraan di **salah satu** jalur | Kembali normal: satu hijau, lainnya merah |
+
+Sistem memindai **setiap jalur** secara berkala; bukan hanya jalur yang sedang hijau.
+
 ## Arsitektur kode
 
 ```
@@ -98,6 +108,7 @@ Tidak perlu mengubah `loop()` atau fungsi transisi.
 | `VEHICLE_THRESHOLD_CM` | 15 | Jarak &lt; nilai ini = ada kendaraan |
 | `SENSOR_INTERVAL_MS` | 200 | Interval baca sensor (ms) |
 | `SENSOR_SAMPLES` | 3 | Jumlah sampel untuk rata-rata |
+| `IDLE_BLINK_MS` | 500 | Interval kedip kuning saat idle (ms) |
 
 ## Instalasi & upload
 
