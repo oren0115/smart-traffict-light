@@ -71,6 +71,24 @@ stateDiagram-v2
 
 Sistem memindai **setiap jalur** secara berkala; bukan hanya jalur yang sedang hijau.
 
+## Perbaikan responsivitas (v2 → v3)
+
+**v2**
+
+- Sensor non-blocking (satu sampel per `loop()`), cache `vehicleDetected[]`, urutan per persimpangan + jeda crosstalk.
+- `MIN_GREEN_MS`, keluar idle round-robin, watchdog `activeIndex`.
+
+**v3**
+
+- **Ultrasonik interrupt-driven** — `attachInterrupt` + `IRAM_ATTR`; tidak ada `pulseIn()` blocking.
+- **Skip jalur kosong** — `finishYellowAndActivateNext()` memakai `findFirstOccupiedIndex()`; jika semua kosong → idle.
+- **Debounce idle ↔ normal** — `IDLE_CONFIRM_SCANS` (3) / `NORMAL_CONFIRM_SCANS` (2) siklus berturut.
+- **`DEBUG_SERIAL`** — set `0` sebelum upload produksi untuk mematikan log sensor di hot path.
+- **`constexpr MAX_INTERSECTIONS`** — batas array cache.
+- **`waitForSensorCycle()`** — hanya di `setup()`; cache tetap valid setelah selesai (tanpa reset ganda).
+
+Build produksi (Arduino IDE): tambah `-DDEBUG_SERIAL=0` di *Compiler flags* atau ubah `#define DEBUG_SERIAL 0` di awal `.ino`.
+
 ## Arsitektur kode
 
 ```
@@ -109,6 +127,11 @@ Tidak perlu mengubah `loop()` atau fungsi transisi.
 | `SENSOR_INTERVAL_MS` | 200 | Interval baca sensor (ms) |
 | `SENSOR_SAMPLES` | 3 | Jumlah sampel untuk rata-rata |
 | `IDLE_BLINK_MS` | 500 | Interval kedip kuning saat idle (ms) |
+| `MIN_GREEN_MS` | 5000 | Hijau minimal sebelum boleh ganti (jalur kosong) |
+| `PULSE_TIMEOUT_US` | 12000 | Timeout `pulseIn` (~200 cm, kurangi blocking) |
+| `SENSOR_CROSSTALK_GAP_MS` | 25 | Jeda antar pembacaan persimpangan |
+| `IDLE_CONFIRM_SCANS` | 3 | Siklus kosong berturut sebelum masuk idle |
+| `NORMAL_CONFIRM_SCANS` | 2 | Siklus ada kendaraan sebelum keluar idle |
 
 ## Instalasi & upload
 
