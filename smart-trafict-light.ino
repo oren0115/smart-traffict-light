@@ -1,168 +1,204 @@
 /*
- * Smart Traffic Light Otomatis - ESP32
- * 2 jalur (A & B), sensor HC-SR04 per jalur
- *
- * Hijau maksimal 60 detik; jika jalur hijau kosong sebelum itu → kuning 3 detik → merah → jalur lain hijau
+ * Smart Traffic Light - ESP32
+ * Arsitektur modular & scalable: tambah persimpangan cukup di array intersections[].
  */
 
-// --- Lampu Jalur A ---
-const int PIN_RED_A    = 23;
-const int PIN_YELLOW_A = 22;
-const int PIN_GREEN_A  = 21;
+#include <Arduino.h>
 
-// --- Lampu Jalur B ---
-const int PIN_RED_B    = 19;
-const int PIN_YELLOW_B = 18;
-const int PIN_GREEN_B  = 5;
+// --- Parameter sistem ---
+const unsigned long GREEN_MAX_MS        = 60000UL;
+const unsigned long YELLOW_DURATION_MS  = 3000UL;
+const int           VEHICLE_THRESHOLD_CM = 15;
+const unsigned long SENSOR_INTERVAL_MS  = 200UL;
+const int           SENSOR_SAMPLES      = 3;
 
-// --- HC-SR04 Jalur A ---
-const int PIN_TRIG_A = 13;
-const int PIN_ECHO_A = 12;
+// --- State machine per lampu ---
+enum LightPhase { PHASE_RED, PHASE_YELLOW, PHASE_GREEN };
 
-// --- HC-SR04 Jalur B ---
-const int PIN_TRIG_B = 14;
-const int PIN_ECHO_B = 27;
+// --- State machine pengontrol (satu hijau aktif) ---
+enum ControllerPhase { CTRL_GREEN, CTRL_YELLOW };
 
-// --- Parameter ---
-const unsigned long GREEN_MAX_MS      = 60000UL;  // 60 detik
-const unsigned long YELLOW_DURATION_MS = 3000UL;  // 3 detik
-const int VEHICLE_THRESHOLD_CM        = 15;       // < 15 cm = ada kendaraan
-const unsigned long SENSOR_INTERVAL_MS = 200UL;   // interval baca sensor
-const int SENSOR_SAMPLES              = 3;        // rata-rata untuk stabilitas
+struct TrafficIntersection {
+  uint8_t    pinRed;
+  uint8_t    pinYellow;
+  uint8_t    pinGreen;
+  uint8_t    pinTrig;
+  uint8_t    pinEcho;
+  LightPhase phase;
+};
 
-enum ActiveLane { LANE_A, LANE_B };
-enum Phase { PHASE_GREEN, PHASE_YELLOW };
+/*
+ * Konfigurasi pin — tambah baris baru untuk persimpangan tambahan.
+ * Jumlah persimpangan dihitung otomatis dari ukuran array.
+ */
+TrafficIntersection intersections[] = {
+  { 23, 22, 21, 13, 12, PHASE_RED },  // Persimpangan 0
+  { 19, 18,  5, 14, 27, PHASE_RED },  // Persimpangan 1
+  // { pinR, pinY, pinG, trig, echo, PHASE_RED },  // Contoh persimpangan 2
+};
 
-ActiveLane activeLane = LANE_A;
-Phase phase = PHASE_GREEN;
+const size_t INTERSECTION_COUNT =
+    sizeof(intersections) / sizeof(intersections[0]);
 
-unsigned long phaseStartMs = 0;
-unsigned long lastSensorReadMs = 0;
-bool vehicleOnGreenLane = false;
+size_t          activeIndex          = 0;
+ControllerPhase controllerPhase      = CTRL_GREEN;
+unsigned long   phaseStartMs         = 0;
+unsigned long   lastSensorReadMs     = 0;
+bool            vehicleOnActiveGreen   = false;
+
+// --- Deklarasi ---
+void initHardware();
+void setRed(size_t index);
+void setYellow(size_t index);
+void setGreen(size_t index);
+void setAllRedExcept(size_t greenIndex);
+long readDistanceCm(uint8_t trigPin, uint8_t echoPin);
+bool isVehiclePresent(size_t index);
+void beginYellowTransition();
+void finishYellowAndActivateNext();
 
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println(F("\n=== Smart Traffic Light ESP32 ==="));
+  Serial.println(F("\n=== Smart Traffic Light ESP32 (Modular) ==="));
+  Serial.print(F("Jumlah persimpangan: "));
+  Serial.println(INTERSECTION_COUNT);
 
-  pinMode(PIN_RED_A, OUTPUT);
-  pinMode(PIN_YELLOW_A, OUTPUT);
-  pinMode(PIN_GREEN_A, OUTPUT);
-  pinMode(PIN_RED_B, OUTPUT);
-  pinMode(PIN_YELLOW_B, OUTPUT);
-  pinMode(PIN_GREEN_B, OUTPUT);
+  initHardware();
 
-  pinMode(PIN_TRIG_A, OUTPUT);
-  pinMode(PIN_ECHO_A, INPUT);
-  pinMode(PIN_TRIG_B, OUTPUT);
-  pinMode(PIN_ECHO_B, INPUT);
-
-  // Kondisi awal: Jalur A hijau, Jalur B merah
-  setLaneLights(LANE_A, false, false, true);   // A: hijau
-  setLaneLights(LANE_B, true, false, false);    // B: merah
-
-  phase = PHASE_GREEN;
-  activeLane = LANE_A;
-  phaseStartMs = millis();
+  activeIndex     = 0;
+  controllerPhase = CTRL_GREEN;
+  phaseStartMs    = millis();
   lastSensorReadMs = 0;
 
-  Serial.println(F("Start: Jalur A HIJAU, Jalur B MERAH"));
+  setAllRedExcept(activeIndex);
+  setGreen(activeIndex);
+  vehicleOnActiveGreen = isVehiclePresent(activeIndex);
+
+  Serial.print(F("Start: persimpangan "));
+  Serial.print(activeIndex);
+  Serial.println(F(" HIJAU"));
 }
 
 void loop() {
-  unsigned long now = millis();
+  const unsigned long now = millis();
 
-  if (phase == PHASE_GREEN) {
+  if (controllerPhase == CTRL_GREEN) {
     if (now - lastSensorReadMs >= SENSOR_INTERVAL_MS) {
-      lastSensorReadMs = now;
-      vehicleOnGreenLane = isVehiclePresent(activeLane);
+      lastSensorReadMs   = now;
+      vehicleOnActiveGreen = isVehiclePresent(activeIndex);
     }
 
-    unsigned long greenElapsed = now - phaseStartMs;
-    bool maxTimeReached = greenElapsed >= GREEN_MAX_MS;
-    bool shouldSwitch = !vehicleOnGreenLane || maxTimeReached;
+    const unsigned long greenElapsed = now - phaseStartMs;
+    const bool maxTimeReached = greenElapsed >= GREEN_MAX_MS;
+    const bool shouldSwitch   = !vehicleOnActiveGreen || maxTimeReached;
 
     if (shouldSwitch) {
       if (maxTimeReached) {
-        Serial.println(F("[Timer] 60 detik habis → ganti jalur"));
+        Serial.print(F("[Timer] Persimpangan "));
+        Serial.print(activeIndex);
+        Serial.println(F(" 60 detik → ganti"));
       } else {
-        Serial.println(F("[Sensor] Jalur hijau kosong → ganti jalur"));
+        Serial.print(F("[Sensor] Persimpangan "));
+        Serial.print(activeIndex);
+        Serial.println(F(" kosong → ganti"));
       }
       beginYellowTransition();
     }
-  } else if (phase == PHASE_YELLOW) {
+  } else if (controllerPhase == CTRL_YELLOW) {
     if (now - phaseStartMs >= YELLOW_DURATION_MS) {
-      finishYellowAndSwitchGreen();
+      finishYellowAndActivateNext();
     }
   }
 }
 
-// Hijau OFF → Kuning ON (jalur yang selesai hijau)
+void initHardware() {
+  for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    pinMode(intersections[i].pinRed, OUTPUT);
+    pinMode(intersections[i].pinYellow, OUTPUT);
+    pinMode(intersections[i].pinGreen, OUTPUT);
+    pinMode(intersections[i].pinTrig, OUTPUT);
+    pinMode(intersections[i].pinEcho, INPUT);
+  }
+}
+
+void writeLightPins(size_t index, bool red, bool yellow, bool green) {
+  digitalWrite(intersections[index].pinRed, red ? HIGH : LOW);
+  digitalWrite(intersections[index].pinYellow, yellow ? HIGH : LOW);
+  digitalWrite(intersections[index].pinGreen, green ? HIGH : LOW);
+}
+
+void setRed(size_t index) {
+  if (index >= INTERSECTION_COUNT) return;
+  writeLightPins(index, true, false, false);
+  intersections[index].phase = PHASE_RED;
+}
+
+void setYellow(size_t index) {
+  if (index >= INTERSECTION_COUNT) return;
+  writeLightPins(index, false, true, false);
+  intersections[index].phase = PHASE_YELLOW;
+}
+
+void setGreen(size_t index) {
+  if (index >= INTERSECTION_COUNT) return;
+  writeLightPins(index, false, false, true);
+  intersections[index].phase = PHASE_GREEN;
+}
+
+void setAllRedExcept(size_t greenIndex) {
+  for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    if (i != greenIndex) {
+      setRed(i);
+    }
+  }
+}
+
 void beginYellowTransition() {
-  ActiveLane finishing = activeLane;
-
-  if (finishing == LANE_A) {
-    setLaneLights(LANE_A, false, true, false);   // kuning A
-    setLaneLights(LANE_B, true, false, false);   // B tetap merah
-    Serial.println(F("Transisi: A KUNING (3 detik)"));
-  } else {
-    setLaneLights(LANE_B, false, true, false);
-    setLaneLights(LANE_A, true, false, false);
-    Serial.println(F("Transisi: B KUNING (3 detik)"));
+  setYellow(activeIndex);
+  for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    if (i != activeIndex) {
+      setRed(i);
+    }
   }
 
-  phase = PHASE_YELLOW;
-  phaseStartMs = millis();
+  controllerPhase = CTRL_YELLOW;
+  phaseStartMs    = millis();
+
+  Serial.print(F("Transisi: persimpangan "));
+  Serial.print(activeIndex);
+  Serial.println(F(" KUNING (3 detik)"));
 }
 
-// Kuning OFF → Merah (jalur lama) → Jalur lain HIJAU
-void finishYellowAndSwitchGreen() {
-  ActiveLane oldLane = activeLane;
-  ActiveLane newLane = (oldLane == LANE_A) ? LANE_B : LANE_A;
+void finishYellowAndActivateNext() {
+  setRed(activeIndex);
 
-  setLaneLights(oldLane, true, false, false);   // merah
-  setLaneLights(newLane, false, false, true);   // hijau
+  activeIndex = (activeIndex + 1) % INTERSECTION_COUNT;
 
-  activeLane = newLane;
-  phase = PHASE_GREEN;
-  phaseStartMs = millis();
-  lastSensorReadMs = 0;
-  vehicleOnGreenLane = isVehiclePresent(activeLane);
+  setAllRedExcept(activeIndex);
+  setGreen(activeIndex);
 
-  if (newLane == LANE_A) {
-    Serial.println(F("Jalur B MERAH → Jalur A HIJAU"));
-  } else {
-    Serial.println(F("Jalur A MERAH → Jalur B HIJAU"));
-  }
+  controllerPhase      = CTRL_GREEN;
+  phaseStartMs         = millis();
+  lastSensorReadMs     = 0;
+  vehicleOnActiveGreen = isVehiclePresent(activeIndex);
+
+  Serial.print(F("Persimpangan "));
+  Serial.print(activeIndex);
+  Serial.println(F(" HIJAU"));
 }
 
-void setLaneLights(ActiveLane lane, bool red, bool yellow, bool green) {
-  int pinR, pinY, pinG;
-  if (lane == LANE_A) {
-    pinR = PIN_RED_A;
-    pinY = PIN_YELLOW_A;
-    pinG = PIN_GREEN_A;
-  } else {
-    pinR = PIN_RED_B;
-    pinY = PIN_YELLOW_B;
-    pinG = PIN_GREEN_B;
-  }
+bool isVehiclePresent(size_t index) {
+  if (index >= INTERSECTION_COUNT) return true;
 
-  // Modul traffic light umumnya active-LOW; ubah ke LOW jika lampu tidak menyala
-  digitalWrite(pinR, red ? HIGH : LOW);
-  digitalWrite(pinY, yellow ? HIGH : LOW);
-  digitalWrite(pinG, green ? HIGH : LOW);
-}
+  const uint8_t trigPin = intersections[index].pinTrig;
+  const uint8_t echoPin = intersections[index].pinEcho;
 
-bool isVehiclePresent(ActiveLane lane) {
-  int trigPin = (lane == LANE_A) ? PIN_TRIG_A : PIN_TRIG_B;
-  int echoPin = (lane == LANE_A) ? PIN_ECHO_A : PIN_ECHO_B;
+  long totalCm      = 0;
+  int  validSamples = 0;
 
-  long totalCm = 0;
-  int validSamples = 0;
-
-  for (int i = 0; i < SENSOR_SAMPLES; i++) {
-    long cm = readDistanceCm(trigPin, echoPin);
+  for (int s = 0; s < SENSOR_SAMPLES; s++) {
+    const long cm = readDistanceCm(trigPin, echoPin);
     if (cm >= 0) {
       totalCm += cm;
       validSamples++;
@@ -171,16 +207,17 @@ bool isVehiclePresent(ActiveLane lane) {
   }
 
   if (validSamples == 0) {
-    // Sensor gagal baca → anggap masih ada kendaraan (lebih aman)
-    Serial.println(F("[Sensor] Gagal baca → anggap ada kendaraan"));
+    Serial.print(F("[Sensor] #"));
+    Serial.print(index);
+    Serial.println(F(" gagal baca → anggap ada kendaraan"));
     return true;
   }
 
-  long avgCm = totalCm / validSamples;
-  bool present = avgCm < VEHICLE_THRESHOLD_CM;
+  const long avgCm   = totalCm / validSamples;
+  const bool present = avgCm < VEHICLE_THRESHOLD_CM;
 
-  Serial.print(F("[Sensor] Jalur "));
-  Serial.print(lane == LANE_A ? 'A' : 'B');
+  Serial.print(F("[Sensor] #"));
+  Serial.print(index);
   Serial.print(F(" jarak="));
   Serial.print(avgCm);
   Serial.print(F(" cm → "));
@@ -189,18 +226,16 @@ bool isVehiclePresent(ActiveLane lane) {
   return present;
 }
 
-long readDistanceCm(int trigPin, int echoPin) {
+long readDistanceCm(uint8_t trigPin, uint8_t echoPin) {
   digitalWrite(trigPin, LOW);
   delayMicroseconds(2);
   digitalWrite(trigPin, HIGH);
   delayMicroseconds(10);
   digitalWrite(trigPin, LOW);
 
-  unsigned long duration = pulseIn(echoPin, HIGH, 30000UL);  // timeout ~30 ms
+  const unsigned long duration = pulseIn(echoPin, HIGH, 30000UL);
   if (duration == 0) {
     return -1;
   }
-
-  // Kecepatan suara ~343 m/s → cm = durasi_us / 58
   return (long)(duration / 58.0);
 }
