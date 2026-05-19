@@ -4,6 +4,8 @@
  */
 
 #include <Arduino.h>
+#include <WiFi.h>
+#include <time.h>
 
 // Set 0 untuk build produksi (tanpa log sensor di hot path)
 #ifndef DEBUG_SERIAL
@@ -20,14 +22,14 @@
 
 // --- Parameter sistem ---
 constexpr size_t  MAX_INTERSECTIONS          = 8;
-const unsigned long GREEN_MAX_MS             = 60000UL;
-const unsigned long MIN_GREEN_MS             = 5000UL;
+const unsigned long GREEN_MAX_MS             = 30000UL;
+const unsigned long MIN_GREEN_MS             = 30000UL;
 const unsigned long YELLOW_DURATION_MS       = 3000UL;
-const int           VEHICLE_THRESHOLD_CM     = 15;
+const int           VEHICLE_THRESHOLD_CM     = 7;
 const unsigned long SENSOR_INTERVAL_MS       = 200UL;
 const unsigned long SENSOR_SAMPLE_GAP_MS     = 10UL;
 const unsigned long SENSOR_CROSSTALK_GAP_MS  = 25UL;
-const unsigned long IDLE_BLINK_MS            = 500UL;
+const unsigned long IDLE_GREEN_MS            = 15000UL;  // hijau tetap saat traffic kosong
 const int           SENSOR_SAMPLES             = 3;
 const unsigned long SETUP_STABILIZE_MS       = 500UL;
 const unsigned long ULTRASONIC_PULSE_LOW_US  = 2UL;
@@ -36,11 +38,27 @@ const unsigned long PULSE_TIMEOUT_US         = 12000UL;
 const uint8_t       IDLE_CONFIRM_SCANS       = 3;  // siklus kosong berturut sebelum idle
 const uint8_t       NORMAL_CONFIRM_SCANS     = 2;  // siklus ada kendaraan sebelum keluar idle
 
+// --- Jadwal malam: kuning kedip (hati-hati), seperti lampu jalan ---
+#ifndef ENABLE_NTP_TIME
+#define ENABLE_NTP_TIME 1
+#endif
+const char* const   WIFI_SSID                = "Gaga";
+const char* const   WIFI_PASSWORD            = "12345678";
+const long          NTP_GMT_OFFSET_SEC       = 7 * 3600;   // WIB UTC+7
+const int           NTP_DAYLIGHT_OFFSET_SEC  = 0;
+const uint8_t       NIGHT_START_HOUR         = 19;
+const uint8_t       NIGHT_START_MINUTE       = 58;
+const uint8_t       NIGHT_END_HOUR           = 20;
+const uint8_t       NIGHT_END_MINUTE         = 00;
+const unsigned long YELLOW_FLASH_HALF_MS     = 500UL;      // periode kedip (on/off)
+const unsigned long TIME_CHECK_INTERVAL_MS   = 30000UL;    // cek jadwal malam
+const unsigned long NTP_SYNC_TIMEOUT_MS      = 15000UL;
+
 // --- State machine per lampu ---
 enum LightPhase { PHASE_RED, PHASE_YELLOW, PHASE_GREEN };
 
 // --- State machine pengontrol ---
-enum ControllerPhase { CTRL_IDLE, CTRL_GREEN, CTRL_YELLOW };
+enum ControllerPhase { CTRL_GREEN, CTRL_YELLOW };
 
 struct TrafficIntersection {
   uint8_t    pinRed;
@@ -54,7 +72,7 @@ struct TrafficIntersection {
 TrafficIntersection intersections[] = {
   { 23, 22, 21, 13, 12, PHASE_RED },  // Persimpangan 0
   { 19, 18,  5, 14, 27, PHASE_RED },  // Persimpangan 1
-  { 25, 26, 32, 33, 35, PHASE_RED },  // Persimpangan 2
+  // { 25, 26, 32, 33, 35, PHASE_RED },  // Persimpangan 2
 };
 
 const size_t INTERSECTION_COUNT =
@@ -64,9 +82,13 @@ size_t          activeIndex          = 0;
 ControllerPhase controllerPhase      = CTRL_GREEN;
 unsigned long   phaseStartMs         = 0;
 unsigned long   lastSensorDecisionMs = 0;
-unsigned long   lastIdleBlinkMs      = 0;
 bool            vehicleOnActiveGreen = false;
-bool            idleYellowOn         = false;
+bool            idleMode             = false;
+bool            nightFlashMode       = false;
+bool            timeSynced           = false;
+bool            yellowFlashOn        = false;
+unsigned long   lastFlashToggleMs    = 0;
+unsigned long   lastTimeCheckMs      = 0;
 
 bool vehicleDetected[MAX_INTERSECTIONS];
 
@@ -109,8 +131,6 @@ void setRed(size_t index);
 void setYellow(size_t index);
 void setGreen(size_t index);
 void setAllRedExcept(size_t greenIndex);
-void setIdleYellowBlink(bool on);
-void updateIdleBlink();
 void detachUltrasonicInterrupt();
 void startAsyncDistanceRead(uint8_t trigPin, uint8_t echoPin);
 long pollAsyncDistanceRead();
@@ -121,7 +141,14 @@ bool isAnyVehiclePresent();
 void ensureValidActiveIndex();
 size_t findFirstOccupiedIndex(size_t startFrom);
 void logSensorReading(size_t index, long avgCm, bool present);
-void enterIdleMode();
+bool syncTimeFromNtp();
+bool isNightHours();
+void updateNightFlashBlink();
+void applyIdleScheduleByTime();
+void setAllYellowFlash(bool on);
+void enterNightFlashMode();
+void exitNightFlashToIdleRotate();
+void enterIdleMode(bool rotateToNext = true);
 void exitIdleToNormal();
 void beginYellowTransition();
 void finishYellowAndActivateNext();
@@ -143,6 +170,15 @@ void setup() {
   Serial.println(INTERSECTION_COUNT);
 
   initHardware();
+
+#if ENABLE_NTP_TIME
+  timeSynced = syncTimeFromNtp();
+  if (!timeSynced) {
+    Serial.println(F("PERINGATAN: NTP gagal → idle malam (kuning kedip) nonaktif"));
+  }
+#else
+  Serial.println(F("NTP nonaktif (ENABLE_NTP_TIME=0) → hanya idle rotasi hijau"));
+#endif
 
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
     vehicleDetected[i] = false;
@@ -167,8 +203,8 @@ void setup() {
     Serial.print(activeIndex);
     Serial.println(F(" HIJAU"));
   } else {
-    enterIdleMode();
-    Serial.println(F("Start: traffic kosong → kuning KEDIP"));
+    enterIdleMode(false);
+    Serial.println(F("Start: traffic kosong → siklus waktu tetap"));
   }
 }
 
@@ -182,28 +218,49 @@ void loop() {
     applySensorDecisions();
   }
 
-  if (controllerPhase == CTRL_IDLE) {
-    updateIdleBlink();
+  if (idleMode && now - lastTimeCheckMs >= TIME_CHECK_INTERVAL_MS) {
+    lastTimeCheckMs = now;
+    applyIdleScheduleByTime();
+  }
+
+  if (nightFlashMode) {
+    updateNightFlashBlink();
     return;
   }
 
   if (controllerPhase == CTRL_GREEN) {
-    const unsigned long greenElapsed = now - phaseStartMs;
-    const bool maxTimeReached = greenElapsed >= GREEN_MAX_MS;
-    const bool minGreenMet    = greenElapsed >= MIN_GREEN_MS;
-    const bool laneEmpty      = !vehicleOnActiveGreen;
-    const bool shouldSwitch   = maxTimeReached || (minGreenMet && laneEmpty);
+    bool shouldSwitch = false;
+
+    if (idleMode) {
+      shouldSwitch = (now - phaseStartMs >= IDLE_GREEN_MS);
+      if (shouldSwitch) {
+        Serial.print(F("[Idle] Persimpangan "));
+        Serial.print(activeIndex);
+        Serial.print(F(" hijau "));
+        Serial.print(IDLE_GREEN_MS / 1000UL);
+        Serial.println(F(" detik → ganti"));
+      }
+    } else {
+      const unsigned long greenElapsed = now - phaseStartMs;
+      const bool maxTimeReached = greenElapsed >= GREEN_MAX_MS;
+      const bool minGreenMet    = greenElapsed >= MIN_GREEN_MS;
+      const bool laneEmpty      = !vehicleOnActiveGreen;
+      shouldSwitch = maxTimeReached || (minGreenMet && laneEmpty);
+
+      if (shouldSwitch) {
+        if (maxTimeReached) {
+          Serial.print(F("[Timer] Persimpangan "));
+          Serial.print(activeIndex);
+          Serial.println(F(" 60 detik → ganti"));
+        } else {
+          Serial.print(F("[Sensor] Persimpangan "));
+          Serial.print(activeIndex);
+          Serial.println(F(" kosong → ganti"));
+        }
+      }
+    }
 
     if (shouldSwitch) {
-      if (maxTimeReached) {
-        Serial.print(F("[Timer] Persimpangan "));
-        Serial.print(activeIndex);
-        Serial.println(F(" 60 detik → ganti"));
-      } else {
-        Serial.print(F("[Sensor] Persimpangan "));
-        Serial.print(activeIndex);
-        Serial.println(F(" kosong → ganti"));
-      }
       beginYellowTransition();
     }
   } else if (controllerPhase == CTRL_YELLOW) {
@@ -216,7 +273,7 @@ void loop() {
 void applySensorDecisions() {
   const bool anyVehicle = isAnyVehiclePresent();
 
-  if (controllerPhase == CTRL_IDLE) {
+  if (idleMode) {
     if (anyVehicle) {
       occupiedConfirmCount++;
       emptyConfirmCount = 0;
@@ -372,7 +429,7 @@ void updateSensorScan() {
 
 void logSensorReading(size_t index, long avgCm, bool present) {
 #if DEBUG_SERIAL
-  if (index != activeIndex && controllerPhase != CTRL_IDLE) {
+  if (index != activeIndex && !idleMode) {
     return;
   }
   DBG_PRINT(F("[Sensor] #"));
@@ -420,7 +477,7 @@ void ensureValidActiveIndex() {
   }
   Serial.println(F("[Watchdog] activeIndex tidak valid → reset ke 0"));
   activeIndex = 0;
-  if (controllerPhase != CTRL_IDLE) {
+  if (!idleMode) {
     enterIdleMode();
   }
 }
@@ -467,43 +524,197 @@ void setAllRedExcept(size_t greenIndex) {
   }
 }
 
-void setIdleYellowBlink(bool on) {
+bool syncTimeFromNtp() {
+#if !ENABLE_NTP_TIME
+  return false;
+#else
+  Serial.print(F("WiFi: "));
+  Serial.println(WIFI_SSID);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  const unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < NTP_SYNC_TIMEOUT_MS) {
+    delay(250);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("WiFi gagal terhubung"));
+    return false;
+  }
+
+  Serial.print(F("IP: "));
+  Serial.println(WiFi.localIP());
+
+  configTime(NTP_GMT_OFFSET_SEC, NTP_DAYLIGHT_OFFSET_SEC, "pool.ntp.org", "time.nist.gov");
+
+  struct tm timeInfo;
+  for (uint8_t attempt = 0; attempt < 20; attempt++) {
+    if (getLocalTime(&timeInfo, 500)) {
+      Serial.printf("Waktu sinkron: %02d:%02d:%02d\n",
+                    timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+      return true;
+    }
+    delay(500);
+  }
+
+  Serial.println(F("Sinkronisasi NTP gagal"));
+  return false;
+#endif
+}
+
+bool isNightHours() {
+#if !ENABLE_NTP_TIME
+  (void)timeSynced;
+  return false;
+#else
+  if (!timeSynced) {
+    return false;
+  }
+
+  struct tm timeInfo;
+  if (!getLocalTime(&timeInfo)) {
+    return false;
+  }
+
+  const int nowMinutes    = timeInfo.tm_hour * 60 + timeInfo.tm_min;
+  const int startMinutes  = NIGHT_START_HOUR * 60 + NIGHT_START_MINUTE;
+  const int endMinutes    = NIGHT_END_HOUR * 60 + NIGHT_END_MINUTE;
+
+  if (startMinutes > endMinutes) {
+    return nowMinutes >= startMinutes || nowMinutes < endMinutes;
+  }
+  return nowMinutes >= startMinutes && nowMinutes < endMinutes;
+#endif
+}
+
+void setAllYellowFlash(bool on) {
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
-    writeLightPins(i, false, on, false);
-    intersections[i].phase = PHASE_YELLOW;
+    if (on) {
+      writeLightPins(i, false, true, false);
+      intersections[i].phase = PHASE_YELLOW;
+    } else {
+      writeLightPins(i, false, false, false);
+    }
   }
+  yellowFlashOn = on;
 }
 
-void updateIdleBlink() {
-  const unsigned long now = millis();
-  if (now - lastIdleBlinkMs < IDLE_BLINK_MS) {
+void enterNightFlashMode() {
+  if (nightFlashMode) {
     return;
   }
-  lastIdleBlinkMs = now;
-  idleYellowOn    = !idleYellowOn;
-  setIdleYellowBlink(idleYellowOn);
-}
 
-void enterIdleMode() {
-  if (controllerPhase == CTRL_IDLE) {
-    return;
-  }
   detachUltrasonicInterrupt();
   scanReadPending = false;
 
-  controllerPhase = CTRL_IDLE;
-  lastIdleBlinkMs = millis();
-  idleYellowOn    = true;
-  setIdleYellowBlink(true);
+  nightFlashMode    = true;
+  idleMode          = true;
+  yellowFlashOn     = true;
+  lastFlashToggleMs = millis();
+  lastTimeCheckMs   = millis();
+  setAllYellowFlash(true);
+
   emptyConfirmCount    = 0;
   occupiedConfirmCount = 0;
-  Serial.println(F("[Idle] Traffic kosong → kuning KEDIP"));
+
+  Serial.print(F("[Malam "));
+  Serial.print(NIGHT_START_HOUR);
+  Serial.print(':');
+  if (NIGHT_START_MINUTE < 10) Serial.print('0');
+  Serial.print(NIGHT_START_MINUTE);
+  Serial.print(F("–"));
+  Serial.print(NIGHT_END_HOUR);
+  Serial.print(':');
+  if (NIGHT_END_MINUTE < 10) Serial.print('0');
+  Serial.println(NIGHT_END_MINUTE);
+  Serial.println(F("] Kuning kedip (hati-hati) — semua persimpangan"));
+}
+
+void exitNightFlashToIdleRotate() {
+  if (!nightFlashMode) {
+    return;
+  }
+
+  nightFlashMode = false;
+  setAllRedExcept(activeIndex);
+  setGreen(activeIndex);
+
+  controllerPhase = CTRL_GREEN;
+  phaseStartMs    = millis();
+
+  Serial.print(F("[Siang] Kembali idle rotasi → persimpangan "));
+  Serial.print(activeIndex);
+  Serial.println(F(" HIJAU"));
+}
+
+void updateNightFlashBlink() {
+  const unsigned long now = millis();
+  if (now - lastFlashToggleMs < YELLOW_FLASH_HALF_MS) {
+    return;
+  }
+  lastFlashToggleMs = now;
+  setAllYellowFlash(!yellowFlashOn);
+}
+
+void applyIdleScheduleByTime() {
+  if (!idleMode || !timeSynced) {
+    return;
+  }
+
+  if (isNightHours() && !nightFlashMode) {
+    enterNightFlashMode();
+  } else if (!isNightHours() && nightFlashMode) {
+    exitNightFlashToIdleRotate();
+  }
+}
+
+void enterIdleMode(bool rotateToNext) {
+  if (idleMode && !nightFlashMode) {
+    return;
+  }
+  if (nightFlashMode && isNightHours()) {
+    return;
+  }
+
+  detachUltrasonicInterrupt();
+  scanReadPending = false;
+
+  idleMode = true;
+  nightFlashMode = false;
+
+#if ENABLE_NTP_TIME
+  if (timeSynced && isNightHours()) {
+    enterNightFlashMode();
+    return;
+  }
+#endif
+
+  if (rotateToNext) {
+    activeIndex = (activeIndex + 1) % INTERSECTION_COUNT;
+  }
+  setAllRedExcept(activeIndex);
+  setGreen(activeIndex);
+
+  controllerPhase      = CTRL_GREEN;
+  phaseStartMs         = millis();
+  lastSensorDecisionMs = millis();
+  lastTimeCheckMs      = millis();
+  emptyConfirmCount    = 0;
+  occupiedConfirmCount = 0;
+  Serial.print(F("[Idle] Traffic kosong → siklus tetap, persimpangan "));
+  Serial.print(activeIndex);
+  Serial.println(F(" HIJAU"));
 }
 
 void exitIdleToNormal() {
   const size_t start = (activeIndex + 1) % INTERSECTION_COUNT;
   activeIndex = findFirstOccupiedIndex(start);
 
+  idleMode       = false;
+  nightFlashMode = false;
   setAllRedExcept(activeIndex);
   setGreen(activeIndex);
 
@@ -537,6 +748,18 @@ void beginYellowTransition() {
 
 void finishYellowAndActivateNext() {
   setRed(activeIndex);
+
+  if (idleMode) {
+    activeIndex = (activeIndex + 1) % INTERSECTION_COUNT;
+    setAllRedExcept(activeIndex);
+    setGreen(activeIndex);
+    controllerPhase = CTRL_GREEN;
+    phaseStartMs      = millis();
+    Serial.print(F("[Idle] Persimpangan "));
+    Serial.print(activeIndex);
+    Serial.println(F(" HIJAU"));
+    return;
+  }
 
   if (!isAnyVehiclePresent()) {
     enterIdleMode();

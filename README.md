@@ -11,7 +11,8 @@ Sistem lampu lalu lintas pintar berbasis **ESP32** dengan arsitektur **modular d
 - **Sensor HC-SR04** per persimpangan — deteksi kendaraan di jalur hijau
 - **Hijau adaptif** — maksimal 60 detik; jika jalur kosong, langsung pindah ke persimpangan berikutnya
 - **Transisi aman** — kuning 3 detik sebelum merah dan pergantian hijau
-- **Mode idle** — jika **semua** jalur kosong (tidak ada kendaraan di sensor manapun), **semua lampu kuning** menyala; operasi hijau/merah berhenti sampai ada kendaraan
+- **Mode idle** — jika **semua** jalur kosong: siang/hari berputar **hijau 15 detik** → kuning 3 detik; **malam (23:30–04:00)** → **kuning kedip** (hati-hati) di semua persimpangan; kembali normal saat ada kendaraan
+- **Jadwal waktu (NTP)** — sinkron jam via WiFi; zona default **WIB (UTC+7)**
 
 ## Perangkat
 
@@ -64,12 +65,31 @@ stateDiagram-v2
 
 ### Mode traffic kosong (idle)
 
-| Kondisi | Lampu |
-|---------|--------|
-| **Semua** sensor tidak mendeteksi kendaraan | **Semua persimpangan kuning kedip** (500 ms on/off, merah & hijau mati) |
-| Ada kendaraan di **salah satu** jalur | Kembali normal: satu hijau, lainnya merah |
+| Kondisi | Jam (NTP) | Lampu |
+|---------|-----------|--------|
+| Semua jalur kosong | Di luar **23:30–04:00** | Rotasi: **hijau 15 detik** → **kuning 3 detik** → persimpangan berikutnya |
+| Semua jalur kosong | **23:30–04:00** (malam) | **Kuning kedip** (~1 Hz) di **semua** persimpangan (mode hati-hati) |
+| Ada kendaraan di salah satu jalur | Kapan saja | Kembali normal: hijau adaptif (sensor + maks. 60 detik) |
 
 Sistem memindai **setiap jalur** secara berkala; bukan hanya jalur yang sedang hijau.
+
+### Konfigurasi WiFi & jadwal malam
+
+Edit di awal `smart-trafict-light.ino`:
+
+```cpp
+const char* const WIFI_SSID     = "SSID_ANDA";
+const char* const WIFI_PASSWORD = "PASSWORD_ANDA";
+// Malam: kuning kedip
+const uint8_t NIGHT_START_HOUR   = 23;
+const uint8_t NIGHT_START_MINUTE = 30;
+const uint8_t NIGHT_END_HOUR     = 4;
+const uint8_t NIGHT_END_MINUTE   = 0;
+```
+
+- `NTP_GMT_OFFSET_SEC`: default **WIB** `7*3600`; WITA `8*3600`, WIT `9*3600`.
+- Jika WiFi/NTP gagal, idle malam **tidak aktif** — tetap rotasi hijau seperti sebelumnya.
+- Set `ENABLE_NTP_TIME` ke `0` (atau `-DENABLE_NTP_TIME=0`) untuk mematikan fitur waktu.
 
 ## Perbaikan responsivitas (v2 → v3)
 
@@ -126,12 +146,15 @@ Tidak perlu mengubah `loop()` atau fungsi transisi.
 | `VEHICLE_THRESHOLD_CM` | 15 | Jarak &lt; nilai ini = ada kendaraan |
 | `SENSOR_INTERVAL_MS` | 200 | Interval baca sensor (ms) |
 | `SENSOR_SAMPLES` | 3 | Jumlah sampel untuk rata-rata |
-| `IDLE_BLINK_MS` | 500 | Interval kedip kuning saat idle (ms) |
+| `IDLE_GREEN_MS` | 15000 | Durasi hijau tetap saat idle (ms) |
 | `MIN_GREEN_MS` | 5000 | Hijau minimal sebelum boleh ganti (jalur kosong) |
 | `PULSE_TIMEOUT_US` | 12000 | Timeout `pulseIn` (~200 cm, kurangi blocking) |
 | `SENSOR_CROSSTALK_GAP_MS` | 25 | Jeda antar pembacaan persimpangan |
 | `IDLE_CONFIRM_SCANS` | 3 | Siklus kosong berturut sebelum masuk idle |
 | `NORMAL_CONFIRM_SCANS` | 2 | Siklus ada kendaraan sebelum keluar idle |
+| `NIGHT_START_HOUR` / `NIGHT_START_MINUTE` | 23 / 30 | Awal jadwal kuning kedip |
+| `NIGHT_END_HOUR` / `NIGHT_END_MINUTE` | 4 / 0 | Akhir jadwal kuning kedip |
+| `YELLOW_FLASH_HALF_MS` | 500 | Setengah periode kedip kuning (ms) |
 
 ## Instalasi & upload
 
@@ -159,6 +182,8 @@ Tidak perlu mengubah `loop()` atau fungsi transisi.
 | Sensor selalu “ADA kendaraan” | Cek jarak ambang, halangan di depan sensor, atau kabel TRIG/ECHO tertukar. |
 | Sensor gagal baca | Sistem menganggap masih ada kendaraan (lebih aman); periksa daya dan koneksi ECHO. |
 | Hanya satu jalur | Pastikan minimal 2 entri di `intersections[]` jika ingin rotasi antar-jalur. |
+| Malam tidak kuning kedip | Isi `WIFI_SSID` / `WIFI_PASSWORD` benar; cek Serial Monitor untuk "Waktu sinkron". |
+| Jam salah | Ubah `NTP_GMT_OFFSET_SEC` sesuai zona Indonesia Anda. |
 
 ## Lisensi
 
