@@ -6,6 +6,8 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <time.h>
+#include <ctype.h>
+#include <string.h>
 
 // Set 0 untuk build produksi (tanpa log sensor di hot path)
 #ifndef DEBUG_SERIAL
@@ -102,6 +104,7 @@ unsigned long   lastTimeCheckMs      = 0;
 bool vehicleDetected[MAX_INTERSECTIONS];
 uint8_t queueLevel[MAX_INTERSECTIONS];
 uint16_t waitCycles[MAX_INTERSECTIONS];
+bool anyVehicleCached = false;
 
 // Debounce transisi idle ↔ normal
 uint8_t emptyConfirmCount    = 0;
@@ -124,6 +127,7 @@ volatile uint32_t usEchoStartUs      = 0;
 volatile uint32_t usEchoDurationUs   = 0;
 volatile uint32_t usWaitStartUs      = 0;
 bool              usInterruptAttached = false;
+bool              sensorLogEnabled = DEBUG_SERIAL;
 
 void IRAM_ATTR ultrasonicEchoIsr() {
   const uint32_t now = micros();
@@ -150,6 +154,7 @@ void updateSensorScan();
 void waitForSensorCycle();
 bool getVehiclePresent(size_t index);
 bool isAnyVehiclePresent();
+void refreshAnyVehicleCache();
 void ensureValidActiveIndex();
 size_t findFirstOccupiedIndex(size_t startFrom);
 size_t selectPriorityIndex(size_t startFrom);
@@ -163,6 +168,7 @@ void applyIdleScheduleByTime();
 void setAllYellowFlash(bool on);
 void enterNightFlashMode();
 void exitNightFlashToIdleRotate();
+void disableWifiAfterTimeSync();
 void enterIdleMode(bool rotateToNext = true);
 void exitIdleToNormal();
 void beginYellowTransition();
@@ -211,6 +217,7 @@ void setup() {
   occupiedConfirmCount   = 0;
 
   waitForSensorCycle();
+  refreshAnyVehicleCache();
 
   if (isAnyVehiclePresent()) {
     activeIndex = selectPriorityIndex(0);
@@ -351,6 +358,8 @@ void printControllerStatus() {
   Serial.print(tuningGreenMinMs / 1000UL);
   Serial.print(F("/"));
   Serial.println(tuningGreenMaxMs / 1000UL);
+  Serial.print(F("Sensor log: "));
+  Serial.println(sensorLogEnabled ? F("ON") : F("OFF"));
 
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
     Serial.print(F("Jalur "));
@@ -369,16 +378,32 @@ void handleSerialCommands() {
     return;
   }
 
-  String cmd = Serial.readStringUntil('\n');
-  cmd.trim();
-  cmd.toLowerCase();
-  if (cmd.length() == 0) {
+  static char cmdBuf[64];
+  const size_t len = Serial.readBytesUntil('\n', cmdBuf, sizeof(cmdBuf) - 1);
+  cmdBuf[len] = '\0';
+  if (len == 0) {
     return;
   }
 
-  if (cmd == F("help")) {
+  // Trim leading spaces and newline/CR sisa terminal.
+  char* cmd = cmdBuf;
+  while (*cmd == ' ' || *cmd == '\t' || *cmd == '\r') {
+    cmd++;
+  }
+  if (*cmd == '\0') {
+    return;
+  }
+
+  size_t end = strlen(cmd);
+  while (end > 0 && (cmd[end - 1] == '\r' || cmd[end - 1] == ' ' || cmd[end - 1] == '\t')) {
+    cmd[end - 1] = '\0';
+    end--;
+  }
+
+  if (strcasecmp(cmd, "help") == 0) {
     Serial.println(F("Perintah:"));
     Serial.println(F("- status"));
+    Serial.println(F("- debug <0|1>"));
     Serial.println(F("- set base <detik>"));
     Serial.println(F("- set per <detik>"));
     Serial.println(F("- set min <detik>"));
@@ -387,12 +412,24 @@ void handleSerialCommands() {
     return;
   }
 
-  if (cmd == F("status")) {
+  if (strcasecmp(cmd, "status") == 0) {
     printControllerStatus();
     return;
   }
 
-  if (cmd == F("set default")) {
+  int debugValue = -1;
+  if (sscanf(cmd, "debug %d", &debugValue) == 1) {
+    if (debugValue == 0 || debugValue == 1) {
+      sensorLogEnabled = debugValue == 1;
+      Serial.print(F("Sensor log "));
+      Serial.println(sensorLogEnabled ? F("AKTIF") : F("NONAKTIF"));
+    } else {
+      Serial.println(F("Nilai debug harus 0 atau 1."));
+    }
+    return;
+  }
+
+  if (strcasecmp(cmd, "set default") == 0) {
     tuningBaseGreenMs = DEFAULT_BASE_GREEN_MS;
     tuningPerLevelMs  = DEFAULT_GREEN_PER_LEVEL_MS;
     tuningGreenMinMs  = DEFAULT_MIN_GREEN_MS;
@@ -403,34 +440,29 @@ void handleSerialCommands() {
     return;
   }
 
-  if (!cmd.startsWith(F("set "))) {
+  char key[12];
+  long valueSec = 0;
+  if (sscanf(cmd, "set %11s %ld", key, &valueSec) != 2) {
     Serial.println(F("Perintah tidak dikenal. ketik 'help'."));
     return;
   }
 
-  const int firstSpace = cmd.indexOf(' ');
-  const int secondSpace = cmd.indexOf(' ', firstSpace + 1);
-  if (secondSpace < 0) {
-    Serial.println(F("Format salah. Contoh: set base 20"));
-    return;
-  }
-
-  const String key = cmd.substring(firstSpace + 1, secondSpace);
-  const String valueText = cmd.substring(secondSpace + 1);
-  const long valueSec = valueText.toInt();
   if (valueSec <= 0) {
     Serial.println(F("Nilai harus > 0 detik."));
     return;
   }
+  for (size_t i = 0; key[i] != '\0'; i++) {
+    key[i] = (char)tolower((unsigned char)key[i]);
+  }
 
   const unsigned long valueMs = (unsigned long)valueSec * 1000UL;
-  if (key == F("base")) {
+  if (strcmp(key, "base") == 0) {
     tuningBaseGreenMs = valueMs;
-  } else if (key == F("per")) {
+  } else if (strcmp(key, "per") == 0) {
     tuningPerLevelMs = valueMs;
-  } else if (key == F("min")) {
+  } else if (strcmp(key, "min") == 0) {
     tuningGreenMinMs = valueMs;
-  } else if (key == F("max")) {
+  } else if (strcmp(key, "max") == 0) {
     tuningGreenMaxMs = valueMs;
   } else {
     Serial.println(F("Key tidak valid. Gunakan: base/per/min/max"));
@@ -555,6 +587,7 @@ void updateSensorScan() {
 
     if (scanIntersection >= INTERSECTION_COUNT) {
       scanIntersection = 0;
+      refreshAnyVehicleCache();
       sensorCacheReady = true;
     }
     scanNextActionMs = now + SENSOR_CROSSTALK_GAP_MS;
@@ -588,6 +621,9 @@ void updateSensorScan() {
 
 void logSensorReading(size_t index, long avgCm, bool present) {
 #if DEBUG_SERIAL
+  if (!sensorLogEnabled) {
+    return;
+  }
   if (index != activeIndex && !idleMode) {
     return;
   }
@@ -608,12 +644,17 @@ bool getVehiclePresent(size_t index) {
 }
 
 bool isAnyVehiclePresent() {
+  return anyVehicleCached;
+}
+
+void refreshAnyVehicleCache() {
+  anyVehicleCached = false;
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
     if (vehicleDetected[i]) {
-      return true;
+      anyVehicleCached = true;
+      return;
     }
   }
-  return false;
 }
 
 size_t findFirstOccupiedIndex(size_t startFrom) {
@@ -781,13 +822,25 @@ bool syncTimeFromNtp() {
     if (getLocalTime(&timeInfo, 500)) {
       Serial.printf("Waktu sinkron: %02d:%02d:%02d\n",
                     timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec);
+      disableWifiAfterTimeSync();
       return true;
     }
     delay(500);
   }
 
   Serial.println(F("Sinkronisasi NTP gagal"));
+  disableWifiAfterTimeSync();
   return false;
+#endif
+}
+
+void disableWifiAfterTimeSync() {
+#if ENABLE_NTP_TIME
+  // WiFi tidak dibutuhkan untuk kontrol lampu harian, matikan agar lebih hemat resource.
+  if (WiFi.getMode() != WIFI_OFF) {
+    WiFi.disconnect(true, true);
+    WiFi.mode(WIFI_OFF);
+  }
 #endif
 }
 
@@ -890,9 +943,10 @@ void applyIdleScheduleByTime() {
     return;
   }
 
-  if (isNightHours() && !nightFlashMode) {
+  const bool nightNow = isNightHours();
+  if (nightNow && !nightFlashMode) {
     enterNightFlashMode();
-  } else if (!isNightHours() && nightFlashMode) {
+  } else if (!nightNow && nightFlashMode) {
     exitNightFlashToIdleRotate();
   }
 }
