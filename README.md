@@ -11,6 +11,8 @@ Sistem lampu lalu lintas pintar berbasis ESP32 dengan multi-sensor ultrasonik pa
 - Mode idle saat semua jalur kosong.
 - Mode malam kuning kedip berdasarkan jadwal NTP.
 - Tuning parameter langsung via Serial Monitor tanpa upload ulang.
+- Logging sensor bisa diaktif/nonaktif saat runtime (`debug 1/0`).
+- WiFi otomatis dimatikan setelah sinkronisasi NTP untuk efisiensi resource.
 
 ## Arsitektur Sistem
 
@@ -61,6 +63,7 @@ Baud rate: `115200`
 Perintah yang tersedia:
 - `help`
 - `status`
+- `debug <0|1>`
 - `set base <detik>`
 - `set per <detik>`
 - `set min <detik>`
@@ -72,9 +75,14 @@ Contoh:
 - `set per 8`
 - `set min 12`
 - `set max 55`
+- `debug 0`
 - `status`
 
-`status` menampilkan mode sistem, jalur aktif, durasi hijau aktif, parameter tuning, serta antrean tiap jalur.
+`status` menampilkan mode sistem, jalur aktif, durasi hijau aktif, parameter tuning, status sensor log, serta antrean tiap jalur.
+
+Catatan:
+- `debug 1` mengaktifkan log pembacaan sensor (berguna saat kalibrasi).
+- `debug 0` menonaktifkan log sensor untuk performa runtime yang lebih stabil.
 
 ## Mode Operasi
 
@@ -83,6 +91,7 @@ Contoh:
 - **Night flash**: pada rentang jadwal malam (`NIGHT_START_*` hingga `NIGHT_END_*`), semua jalur kuning kedip.
 
 Jika sinkronisasi WiFi/NTP gagal, mode malam tidak aktif dan sistem tetap berjalan normal/idle.
+Setelah sinkronisasi selesai (sukses/gagal), WiFi dimatikan otomatis untuk mengurangi beban sistem.
 
 ## Instalasi dan Upload
 
