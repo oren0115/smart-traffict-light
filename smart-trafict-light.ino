@@ -22,8 +22,11 @@
 
 // --- Parameter sistem ---
 constexpr size_t  MAX_INTERSECTIONS          = 8;
-const unsigned long GREEN_MAX_MS             = 30000UL;
-const unsigned long MIN_GREEN_MS             = 30000UL;
+constexpr uint8_t MAX_SENSORS_PER_LANE       = 4;
+const unsigned long DEFAULT_BASE_GREEN_MS    = 15000UL;
+const unsigned long DEFAULT_GREEN_PER_LEVEL_MS = 7000UL;
+const unsigned long DEFAULT_GREEN_MAX_MS     = 60000UL;
+const unsigned long DEFAULT_MIN_GREEN_MS     = 10000UL;
 const unsigned long YELLOW_DURATION_MS       = 3000UL;
 const int           VEHICLE_THRESHOLD_CM     = 7;
 const unsigned long SENSOR_INTERVAL_MS       = 200UL;
@@ -64,15 +67,16 @@ struct TrafficIntersection {
   uint8_t    pinRed;
   uint8_t    pinYellow;
   uint8_t    pinGreen;
-  uint8_t    pinTrig;
-  uint8_t    pinEcho;
+  uint8_t    sensorCount;
+  uint8_t    pinTrig[MAX_SENSORS_PER_LANE];
+  uint8_t    pinEcho[MAX_SENSORS_PER_LANE];
   LightPhase phase;
 };
 
 TrafficIntersection intersections[] = {
-  { 23, 22, 21, 13, 12, PHASE_RED },  // Persimpangan 0
-  { 19, 18,  5, 14, 27, PHASE_RED },  // Persimpangan 1
-  // { 25, 26, 32, 33, 35, PHASE_RED },  // Persimpangan 2
+  // Format: {red, yellow, green, jumlahSensor, {trig...}, {echo...}, phase}
+  { 23, 22, 21, 2, { 13, 25, 255, 255 }, { 12, 26, 255, 255 }, PHASE_RED },  // Jalur 0
+  { 19, 18,  5, 2, { 14, 33, 255, 255 }, { 27, 32, 255, 255 }, PHASE_RED },  // Jalur 1
 };
 
 const size_t INTERSECTION_COUNT =
@@ -83,6 +87,11 @@ ControllerPhase controllerPhase      = CTRL_GREEN;
 unsigned long   phaseStartMs         = 0;
 unsigned long   lastSensorDecisionMs = 0;
 bool            vehicleOnActiveGreen = false;
+unsigned long   activeGreenDurationMs = DEFAULT_BASE_GREEN_MS;
+unsigned long   tuningBaseGreenMs     = DEFAULT_BASE_GREEN_MS;
+unsigned long   tuningPerLevelMs      = DEFAULT_GREEN_PER_LEVEL_MS;
+unsigned long   tuningGreenMaxMs      = DEFAULT_GREEN_MAX_MS;
+unsigned long   tuningGreenMinMs      = DEFAULT_MIN_GREEN_MS;
 bool            idleMode             = false;
 bool            nightFlashMode       = false;
 bool            timeSynced           = false;
@@ -91,6 +100,8 @@ unsigned long   lastFlashToggleMs    = 0;
 unsigned long   lastTimeCheckMs      = 0;
 
 bool vehicleDetected[MAX_INTERSECTIONS];
+uint8_t queueLevel[MAX_INTERSECTIONS];
+uint16_t waitCycles[MAX_INTERSECTIONS];
 
 // Debounce transisi idle ↔ normal
 uint8_t emptyConfirmCount    = 0;
@@ -98,6 +109,7 @@ uint8_t occupiedConfirmCount = 0;
 
 // Scanner ultrasonik (non-blocking, interrupt echo)
 size_t          scanIntersection = 0;
+uint8_t         scanSensorIndex  = 0;
 uint8_t         scanSampleNum    = 0;
 long            scanAccumCm      = 0;
 int             scanValidCount   = 0;
@@ -140,6 +152,9 @@ bool getVehiclePresent(size_t index);
 bool isAnyVehiclePresent();
 void ensureValidActiveIndex();
 size_t findFirstOccupiedIndex(size_t startFrom);
+size_t selectPriorityIndex(size_t startFrom);
+unsigned long computeDynamicGreenDuration(size_t index);
+void updateWaitCycles(size_t servedIndex);
 void logSensorReading(size_t index, long avgCm, bool present);
 bool syncTimeFromNtp();
 bool isNightHours();
@@ -153,6 +168,8 @@ void exitIdleToNormal();
 void beginYellowTransition();
 void finishYellowAndActivateNext();
 void applySensorDecisions();
+void handleSerialCommands();
+void printControllerStatus();
 
 void setup() {
   Serial.begin(115200);
@@ -182,6 +199,8 @@ void setup() {
 
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
     vehicleDetected[i] = false;
+    queueLevel[i] = 0;
+    waitCycles[i] = 0;
   }
 
   activeIndex            = 0;
@@ -194,21 +213,30 @@ void setup() {
   waitForSensorCycle();
 
   if (isAnyVehiclePresent()) {
-    activeIndex = findFirstOccupiedIndex(0);
+    activeIndex = selectPriorityIndex(0);
     controllerPhase = CTRL_GREEN;
     setAllRedExcept(activeIndex);
     setGreen(activeIndex);
     vehicleOnActiveGreen = getVehiclePresent(activeIndex);
+    activeGreenDurationMs = computeDynamicGreenDuration(activeIndex);
+    updateWaitCycles(activeIndex);
     Serial.print(F("Start: persimpangan "));
     Serial.print(activeIndex);
-    Serial.println(F(" HIJAU"));
+    Serial.print(F(" HIJAU | antrean="));
+    Serial.print(queueLevel[activeIndex]);
+    Serial.print(F(" | hijau="));
+    Serial.print(activeGreenDurationMs / 1000UL);
+    Serial.println(F(" detik"));
   } else {
     enterIdleMode(false);
     Serial.println(F("Start: traffic kosong → siklus waktu tetap"));
   }
+
+  Serial.println(F("Serial command siap. ketik 'help' untuk daftar perintah."));
 }
 
 void loop() {
+  handleSerialCommands();
   ensureValidActiveIndex();
   updateSensorScan();
 
@@ -242,8 +270,8 @@ void loop() {
       }
     } else {
       const unsigned long greenElapsed = now - phaseStartMs;
-      const bool maxTimeReached = greenElapsed >= GREEN_MAX_MS;
-      const bool minGreenMet    = greenElapsed >= MIN_GREEN_MS;
+      const bool maxTimeReached = greenElapsed >= activeGreenDurationMs;
+      const bool minGreenMet    = greenElapsed >= tuningGreenMinMs;
       const bool laneEmpty      = !vehicleOnActiveGreen;
       shouldSwitch = maxTimeReached || (minGreenMet && laneEmpty);
 
@@ -251,7 +279,7 @@ void loop() {
         if (maxTimeReached) {
           Serial.print(F("[Timer] Persimpangan "));
           Serial.print(activeIndex);
-          Serial.println(F(" 60 detik → ganti"));
+          Serial.println(F(" selesai durasi dinamis → ganti"));
         } else {
           Serial.print(F("[Sensor] Persimpangan "));
           Serial.print(activeIndex);
@@ -298,6 +326,120 @@ void applySensorDecisions() {
     emptyConfirmCount = 0;
     vehicleOnActiveGreen = getVehiclePresent(activeIndex);
   }
+}
+
+void printControllerStatus() {
+  Serial.println(F("\n=== STATUS SMART TRAFFIC ==="));
+  Serial.print(F("Mode: "));
+  if (nightFlashMode) {
+    Serial.println(F("NIGHT_FLASH"));
+  } else if (idleMode) {
+    Serial.println(F("IDLE"));
+  } else {
+    Serial.println(F("NORMAL"));
+  }
+
+  Serial.print(F("Active lane: "));
+  Serial.println(activeIndex);
+  Serial.print(F("Durasi hijau aktif (detik): "));
+  Serial.println(activeGreenDurationMs / 1000UL);
+  Serial.print(F("Tuning (base/per/min/max detik): "));
+  Serial.print(tuningBaseGreenMs / 1000UL);
+  Serial.print(F("/"));
+  Serial.print(tuningPerLevelMs / 1000UL);
+  Serial.print(F("/"));
+  Serial.print(tuningGreenMinMs / 1000UL);
+  Serial.print(F("/"));
+  Serial.println(tuningGreenMaxMs / 1000UL);
+
+  for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    Serial.print(F("Jalur "));
+    Serial.print(i);
+    Serial.print(F(" -> antrean="));
+    Serial.print(queueLevel[i]);
+    Serial.print(F(", ada kendaraan="));
+    Serial.print(vehicleDetected[i] ? F("YA") : F("TIDAK"));
+    Serial.print(F(", waitCycles="));
+    Serial.println(waitCycles[i]);
+  }
+}
+
+void handleSerialCommands() {
+  if (!Serial.available()) {
+    return;
+  }
+
+  String cmd = Serial.readStringUntil('\n');
+  cmd.trim();
+  cmd.toLowerCase();
+  if (cmd.length() == 0) {
+    return;
+  }
+
+  if (cmd == F("help")) {
+    Serial.println(F("Perintah:"));
+    Serial.println(F("- status"));
+    Serial.println(F("- set base <detik>"));
+    Serial.println(F("- set per <detik>"));
+    Serial.println(F("- set min <detik>"));
+    Serial.println(F("- set max <detik>"));
+    Serial.println(F("- set default"));
+    return;
+  }
+
+  if (cmd == F("status")) {
+    printControllerStatus();
+    return;
+  }
+
+  if (cmd == F("set default")) {
+    tuningBaseGreenMs = DEFAULT_BASE_GREEN_MS;
+    tuningPerLevelMs  = DEFAULT_GREEN_PER_LEVEL_MS;
+    tuningGreenMinMs  = DEFAULT_MIN_GREEN_MS;
+    tuningGreenMaxMs  = DEFAULT_GREEN_MAX_MS;
+    activeGreenDurationMs = computeDynamicGreenDuration(activeIndex);
+    Serial.println(F("Tuning dikembalikan ke default."));
+    printControllerStatus();
+    return;
+  }
+
+  if (!cmd.startsWith(F("set "))) {
+    Serial.println(F("Perintah tidak dikenal. ketik 'help'."));
+    return;
+  }
+
+  const int firstSpace = cmd.indexOf(' ');
+  const int secondSpace = cmd.indexOf(' ', firstSpace + 1);
+  if (secondSpace < 0) {
+    Serial.println(F("Format salah. Contoh: set base 20"));
+    return;
+  }
+
+  const String key = cmd.substring(firstSpace + 1, secondSpace);
+  const String valueText = cmd.substring(secondSpace + 1);
+  const long valueSec = valueText.toInt();
+  if (valueSec <= 0) {
+    Serial.println(F("Nilai harus > 0 detik."));
+    return;
+  }
+
+  const unsigned long valueMs = (unsigned long)valueSec * 1000UL;
+  if (key == F("base")) {
+    tuningBaseGreenMs = valueMs;
+  } else if (key == F("per")) {
+    tuningPerLevelMs = valueMs;
+  } else if (key == F("min")) {
+    tuningGreenMinMs = valueMs;
+  } else if (key == F("max")) {
+    tuningGreenMaxMs = valueMs;
+  } else {
+    Serial.println(F("Key tidak valid. Gunakan: base/per/min/max"));
+    return;
+  }
+
+  activeGreenDurationMs = computeDynamicGreenDuration(activeIndex);
+  Serial.println(F("Tuning diperbarui."));
+  printControllerStatus();
 }
 
 /*
@@ -359,19 +501,31 @@ long pollAsyncDistanceRead() {
 }
 
 void finalizeScanIntersection(size_t idx) {
+  const uint8_t sensorCount = intersections[idx].sensorCount;
   if (scanValidCount == 0) {
     vehicleDetected[idx] = true;
+    if (queueLevel[idx] < sensorCount) {
+      queueLevel[idx]++;
+    }
     DBG_PRINT(F("[Sensor] #"));
     DBG_PRINT(idx);
     DBG_PRINTLN(F(" gagal baca → anggap ada kendaraan"));
   } else {
     const long avgCm = scanAccumCm / scanValidCount;
-    vehicleDetected[idx] = avgCm < VEHICLE_THRESHOLD_CM;
-    logSensorReading(idx, avgCm, vehicleDetected[idx]);
+    const bool present = avgCm < VEHICLE_THRESHOLD_CM;
+    if (present && queueLevel[idx] < sensorCount) {
+      queueLevel[idx]++;
+    }
+    logSensorReading(idx, avgCm, present);
   }
 
   scanSampleNum = 0;
-  scanIntersection++;
+  scanSensorIndex++;
+  if (scanSensorIndex >= sensorCount) {
+    vehicleDetected[idx] = queueLevel[idx] > 0;
+    scanSensorIndex = 0;
+    scanIntersection++;
+  }
 }
 
 void updateSensorScan() {
@@ -413,6 +567,7 @@ void updateSensorScan() {
 
   if (scanIntersection >= INTERSECTION_COUNT) {
     scanIntersection = 0;
+    scanSensorIndex = 0;
   }
 
   if (scanSampleNum == 0) {
@@ -420,8 +575,12 @@ void updateSensorScan() {
     scanValidCount = 0;
   }
 
-  const uint8_t trigPin = intersections[scanIntersection].pinTrig;
-  const uint8_t echoPin = intersections[scanIntersection].pinEcho;
+  if (scanSensorIndex == 0 && scanSampleNum == 0) {
+    queueLevel[scanIntersection] = 0;
+  }
+
+  const uint8_t trigPin = intersections[scanIntersection].pinTrig[scanSensorIndex];
+  const uint8_t echoPin = intersections[scanIntersection].pinEcho[scanSensorIndex];
 
   startAsyncDistanceRead(trigPin, echoPin);
   scanReadPending = true;
@@ -471,6 +630,63 @@ size_t findFirstOccupiedIndex(size_t startFrom) {
   return start;
 }
 
+size_t selectPriorityIndex(size_t startFrom) {
+  if (INTERSECTION_COUNT == 0) {
+    return 0;
+  }
+
+  const size_t start = startFrom % INTERSECTION_COUNT;
+  size_t bestIndex = start;
+  int bestScore = -1;
+
+  for (size_t k = 0; k < INTERSECTION_COUNT; k++) {
+    const size_t i = (start + k) % INTERSECTION_COUNT;
+    if (!getVehiclePresent(i)) {
+      continue;
+    }
+
+    // Bobot antrean lebih tinggi, waitCycles mencegah starvation.
+    const int score = (int)queueLevel[i] * 100 + (int)waitCycles[i] * 10;
+    if (score > bestScore) {
+      bestScore = score;
+      bestIndex = i;
+    }
+  }
+
+  if (bestScore < 0) {
+    return start;
+  }
+  return bestIndex;
+}
+
+unsigned long computeDynamicGreenDuration(size_t index) {
+  if (index >= INTERSECTION_COUNT) {
+    return tuningBaseGreenMs;
+  }
+  unsigned long minGreen = tuningGreenMinMs;
+  unsigned long maxGreen = tuningGreenMaxMs;
+  if (minGreen > maxGreen) {
+    const unsigned long tmp = minGreen;
+    minGreen = maxGreen;
+    maxGreen = tmp;
+  }
+
+  const unsigned long dynamicMs = tuningBaseGreenMs + (unsigned long)queueLevel[index] * tuningPerLevelMs;
+  return constrain(dynamicMs, minGreen, maxGreen);
+}
+
+void updateWaitCycles(size_t servedIndex) {
+  for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    if (i == servedIndex) {
+      waitCycles[i] = 0;
+    } else if (getVehiclePresent(i) && waitCycles[i] < 1000) {
+      waitCycles[i]++;
+    } else if (!getVehiclePresent(i)) {
+      waitCycles[i] = 0;
+    }
+  }
+}
+
 void ensureValidActiveIndex() {
   if (activeIndex < INTERSECTION_COUNT) {
     return;
@@ -484,11 +700,21 @@ void ensureValidActiveIndex() {
 
 void initHardware() {
   for (size_t i = 0; i < INTERSECTION_COUNT; i++) {
+    if (intersections[i].sensorCount == 0 || intersections[i].sensorCount > MAX_SENSORS_PER_LANE) {
+      Serial.print(F("ERROR: sensorCount tidak valid di jalur "));
+      Serial.println(i);
+      while (true) {
+        delay(1000);
+      }
+    }
+
     pinMode(intersections[i].pinRed, OUTPUT);
     pinMode(intersections[i].pinYellow, OUTPUT);
     pinMode(intersections[i].pinGreen, OUTPUT);
-    pinMode(intersections[i].pinTrig, OUTPUT);
-    pinMode(intersections[i].pinEcho, INPUT);
+    for (uint8_t s = 0; s < intersections[i].sensorCount; s++) {
+      pinMode(intersections[i].pinTrig[s], OUTPUT);
+      pinMode(intersections[i].pinEcho[s], INPUT);
+    }
   }
 }
 
@@ -700,6 +926,7 @@ void enterIdleMode(bool rotateToNext) {
 
   controllerPhase      = CTRL_GREEN;
   phaseStartMs         = millis();
+  activeGreenDurationMs = IDLE_GREEN_MS;
   lastSensorDecisionMs = millis();
   lastTimeCheckMs      = millis();
   emptyConfirmCount    = 0;
@@ -711,7 +938,7 @@ void enterIdleMode(bool rotateToNext) {
 
 void exitIdleToNormal() {
   const size_t start = (activeIndex + 1) % INTERSECTION_COUNT;
-  activeIndex = findFirstOccupiedIndex(start);
+  activeIndex = selectPriorityIndex(start);
 
   idleMode       = false;
   nightFlashMode = false;
@@ -720,14 +947,20 @@ void exitIdleToNormal() {
 
   controllerPhase      = CTRL_GREEN;
   phaseStartMs         = millis();
+  activeGreenDurationMs = computeDynamicGreenDuration(activeIndex);
   lastSensorDecisionMs = millis();
   vehicleOnActiveGreen = getVehiclePresent(activeIndex);
+  updateWaitCycles(activeIndex);
   emptyConfirmCount    = 0;
   occupiedConfirmCount = 0;
 
   Serial.print(F("[Normal] Kendaraan terdeteksi → persimpangan "));
   Serial.print(activeIndex);
-  Serial.println(F(" HIJAU"));
+  Serial.print(F(" HIJAU | antrean="));
+  Serial.print(queueLevel[activeIndex]);
+  Serial.print(F(" | hijau="));
+  Serial.print(activeGreenDurationMs / 1000UL);
+  Serial.println(F(" detik"));
 }
 
 void beginYellowTransition() {
@@ -767,16 +1000,22 @@ void finishYellowAndActivateNext() {
   }
 
   const size_t nextStart = (activeIndex + 1) % INTERSECTION_COUNT;
-  activeIndex = findFirstOccupiedIndex(nextStart);
+  activeIndex = selectPriorityIndex(nextStart);
 
   setAllRedExcept(activeIndex);
   setGreen(activeIndex);
 
   controllerPhase      = CTRL_GREEN;
   phaseStartMs         = millis();
+  activeGreenDurationMs = computeDynamicGreenDuration(activeIndex);
   vehicleOnActiveGreen = getVehiclePresent(activeIndex);
+  updateWaitCycles(activeIndex);
 
   Serial.print(F("Persimpangan "));
   Serial.print(activeIndex);
-  Serial.println(F(" HIJAU"));
+  Serial.print(F(" HIJAU | antrean="));
+  Serial.print(queueLevel[activeIndex]);
+  Serial.print(F(" | hijau="));
+  Serial.print(activeGreenDurationMs / 1000UL);
+  Serial.println(F(" detik"));
 }
