@@ -1,122 +1,76 @@
-# Smart Traffic Light (ESP32)
+# Smart Traffic Light (ESP32) — 2 Gang
 
-Sistem lampu lalu lintas pintar berbasis ESP32 dengan multi-sensor ultrasonik pada tiap jalur untuk mendeteksi panjang antrean kendaraan, memilih jalur paling padat, lalu memberi durasi hijau lebih lama secara dinamis.
+Sistem lampu lalu lintas pintar berbasis ESP32 untuk **tepat 2 gang** (persimpangan 2 arah). Saat Gang 1 hijau, Gang 2 merah — dan sebaliknya.
 
 ## Fitur Utama
 
-- Prioritas jalur terpadat memakai skor antrean + waktu tunggu (anti-starvation).
-- Multi-sensor HC-SR04 per jalur (`sensorCount` per entri `intersections[]`).
-- Scanner ultrasonik non-blocking dan interrupt-driven.
-- Durasi hijau dinamis (`base + per_level * queueLevel`) dengan batas min/max.
-- Mode idle saat semua jalur kosong.
-- Mode malam kuning kedip berdasarkan jadwal NTP.
-- Tuning parameter langsung via Serial Monitor tanpa upload ulang.
-- Logging sensor bisa diaktif/nonaktif saat runtime (`debug 1/0`).
-- WiFi otomatis dimatikan setelah sinkronisasi NTP untuk efisiensi resource.
+- **2 gang** dengan lampu M/K/H dan 2 sensor HC-SR04 per gang.
+- Prioritas gang terpadat (skor antrean + waktu tunggu).
+- Scanner ultrasonik non-blocking (interrupt echo).
+- Durasi hijau dinamis dengan batas min/max.
+- Mode idle saat semua gang kosong (rotasi hijau tetap).
+- Mode malam: kuning kedip (NTP).
+- Tuning via Serial Monitor (`115200`).
 
-## Arsitektur Sistem
+## Logika Lampu (2 Gang)
 
-1. Setiap jalur memiliki 1..4 sensor ultrasonik.
-2. Sistem membaca sensor per jalur, menghitung `queueLevel[]` (berapa sensor yang tertutup kendaraan).
-3. Jalur berikutnya dipilih dari skor prioritas:
-   - bobot antrean (`queueLevel`) lebih tinggi,
-   - ditambah `waitCycles` agar jalur lain tidak kelaparan.
-4. Durasi hijau aktif dihitung dinamis berdasarkan antrean jalur terpilih.
-5. Transisi aman tetap: hijau -> kuning -> merah -> jalur berikutnya.
+| Fase | Gang aktif (hijau) | Gang lain |
+|------|-------------------|-----------|
+| Hijau | Hijau | **Merah** |
+| Kuning | Kuning | Merah |
+| Jeda aman | Merah | Merah |
+| Ganti | — | Gang lain hijau |
 
-## Konfigurasi Jalur dan Sensor
+Transisi: **Hijau (min 10 s) → Kuning (3 s) → Semua merah (2 s) → Hijau gang berikutnya.**
 
-Konfigurasi ada di `intersections[]` pada `smart-trafict-light.ino`:
+## Konfigurasi Pin (`intersections[]`)
+
+Proyek ini **wajib 2 entri** di array. Jangan tambah entri ketiga tanpa mengubah `MAX_INTERSECTIONS`.
 
 ```cpp
-// Format:
-// {pinRed, pinYellow, pinGreen, sensorCount, {trig...}, {echo...}, PHASE_RED}
 TrafficIntersection intersections[] = {
-  { 23, 22, 21, 2, { 13, 25, 255, 255 }, { 12, 26, 255, 255 }, PHASE_RED },
-  { 19, 18,  5, 2, { 14, 33, 255, 255 }, { 27, 32, 255, 255 }, PHASE_RED },
+  // Gang 1 (index 0): M12 K14 H27 | TRIG 13,25 | ECHO 26,33
+  { 12, 14, 27, 2, { 13, 25, 255, 255 }, { 26, 33, 255, 255 }, PHASE_RED },
+  // Gang 2 (index 1): M19 K18 H5 | TRIG 4,16 | ECHO 32,34
+  { 19, 18,  5, 2, {  4, 16, 255, 255 }, { 32, 34, 255, 255 }, PHASE_RED },
 };
 ```
 
-Keterangan:
-- `sensorCount` maksimal `MAX_SENSORS_PER_LANE` (default 4).
-- Isi slot sensor yang tidak dipakai dengan placeholder (contoh `255`).
-- Pastikan pin echo aman untuk ESP32 (gunakan level shifter/pembagi tegangan bila perlu).
+| Gang | Merah | Kuning | Hijau | Trig | Echo |
+|------|-------|--------|-------|------|------|
+| 1 | 12 | 14 | 27 | 13, 25 | 26, 33 |
+| 2 | 19 | 18 | 5 | 4, 16 | 32, 34 |
 
-## Parameter Algoritma
+> GPIO 14 hanya untuk **kuning Gang 1**. Sensor Gang 2 memakai **GPIO 4** (bukan 14).
 
-Parameter default di sketch:
+## Parameter Default
+
 - `DEFAULT_BASE_GREEN_MS = 15000`
 - `DEFAULT_GREEN_PER_LEVEL_MS = 7000`
 - `DEFAULT_MIN_GREEN_MS = 10000`
 - `DEFAULT_GREEN_MAX_MS = 60000`
+- `YELLOW_DURATION_MS = 3000`
+- `RED_HOLD_MS = 2000`
 
-Rumus durasi hijau:
+## Serial Monitor
 
-```text
-green_time = clamp(base + queueLevel * per_level, min, max)
-```
+| Perintah | Fungsi |
+|----------|--------|
+| `help` | Daftar perintah |
+| `status` | Mode, gang aktif, tuning |
+| `debug 0/1` | Log sensor on/off |
+| `set base/per/min/max <detik>` | Tuning |
+| `set default` | Reset tuning |
 
-## Tuning Runtime Via Serial
+## Simulasi Wokwi
 
-Baud rate: `115200`
+Buka `diagram.json` + `smart-trafict-light.ino` di [wokwi.com](https://wokwi.com). Diagram sudah diset untuk 2 gang sesuai pin di atas.
 
-Perintah yang tersedia:
-- `help`
-- `status`
-- `debug <0|1>`
-- `set base <detik>`
-- `set per <detik>`
-- `set min <detik>`
-- `set max <detik>`
-- `set default`
+## Wiring
 
-Contoh:
-- `set base 20`
-- `set per 8`
-- `set min 12`
-- `set max 55`
-- `debug 0`
-- `status`
-
-`status` menampilkan mode sistem, jalur aktif, durasi hijau aktif, parameter tuning, status sensor log, serta antrean tiap jalur.
-
-Catatan:
-- `debug 1` mengaktifkan log pembacaan sensor (berguna saat kalibrasi).
-- `debug 0` menonaktifkan log sensor untuk performa runtime yang lebih stabil.
-
-## Mode Operasi
-
-- **Normal**: jalur dipilih berdasar skor prioritas dan antrean.
-- **Idle**: jika semua jalur kosong, sistem rotasi fixed-time.
-- **Night flash**: pada rentang jadwal malam (`NIGHT_START_*` hingga `NIGHT_END_*`), semua jalur kuning kedip.
-
-Jika sinkronisasi WiFi/NTP gagal, mode malam tidak aktif dan sistem tetap berjalan normal/idle.
-Setelah sinkronisasi selesai (sukses/gagal), WiFi dimatikan otomatis untuk mengurangi beban sistem.
-
-## Instalasi dan Upload
-
-1. Install Arduino IDE / PlatformIO.
-2. Install board package ESP32 by Espressif.
-3. Pilih board ESP32 sesuai device.
-4. Buka `smart-trafict-light.ino`.
-5. Atur `WIFI_SSID` dan `WIFI_PASSWORD` bila memakai NTP.
-6. Upload ke board, buka Serial Monitor `115200`.
-
-## Catatan Wiring
-
-- Lampu lalu lintas: sesuaikan apakah modul active-high atau active-low.
-- HC-SR04:
-  - VCC sesuai modul (umumnya 5V),
-  - GND common dengan ESP32,
-  - ECHO ke ESP32 wajib level aman 3.3V.
-- Jaga jarak dan arah sensor agar crosstalk minimal.
-
-## Troubleshooting Singkat
-
-- Sensor selalu terdeteksi: cek threshold `VEHICLE_THRESHOLD_CM`, orientasi sensor, dan noise.
-- Pembacaan sering timeout: cek kabel echo/trig, suplai daya, dan ground common.
-- Prioritas tidak terasa: cek `queueLevel` dan tuning `base/per/min/max` via `status`.
-- Mode malam tidak aktif: cek WiFi, NTP, dan offset zona waktu.
+- Lampu: active-high default (`LIGHT_ACTIVE_LOW 0`). Jika relay active-low, set `#define LIGHT_ACTIVE_LOW 1`.
+- HC-SR04: ECHO ke ESP32 harus level aman 3.3V.
+- GPIO 5 (hijau Gang 2): pin strapping — hindari level tinggi saat boot.
 
 ## Lisensi
 
